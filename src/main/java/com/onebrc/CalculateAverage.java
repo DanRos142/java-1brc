@@ -1,10 +1,11 @@
 package com.onebrc;
 
+import sun.misc.Unsafe;
+
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.ByteBuffer;
+import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -26,12 +27,16 @@ public class CalculateAverage {
     private static final byte ZERO = 48;
 
     private static class Aggregate {
+        private long nameStart;
+        private long nameEnd;
         private double min;
         private double max;
         private double sum;
         private long count;
 
-        Aggregate(double value) {
+        Aggregate(long nameStart, long nameEnd, double value) {
+            this.nameStart = nameStart;
+            this.nameEnd = nameEnd;
             this.min = value;
             this.max = value;
             this.sum = value;
@@ -62,13 +67,13 @@ public class CalculateAverage {
         }
     }
 
-    public static void main(String[] args) throws IOException, InterruptedException {
+    public static void main(String[] args) throws IOException, InterruptedException, NoSuchFieldException, IllegalAccessException {
         var start = Instant.now();
         calculate();
         System.out.println(Duration.between(start, Instant.now()).toString());
     }
 
-    private static void calculate() throws IOException, InterruptedException {
+    private static void calculate() throws IOException, InterruptedException, NoSuchFieldException, IllegalAccessException {
         var channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ);
 
         long size = channel.size();
@@ -79,28 +84,31 @@ public class CalculateAverage {
         @SuppressWarnings("unchecked")
         Map<Integer, Aggregate>[] results = new Map[processors];
 
-        var mappedBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, size, Arena.global());
-        var nameMap = new HashMap<Integer, byte[]>();
+        var segment = channel.map(FileChannel.MapMode.READ_ONLY, 0, size, Arena.global());
+        long address = segment.address();
+
+        Field f = Unsafe.class.getDeclaredField("theUnsafe");
+        f.setAccessible(true);
+        var unsafe = (Unsafe) f.get(null);
 
         var executor = Executors.newFixedThreadPool(processors);
 
         long start = 0;
         for (int i = 0; i < processors; i++) {
             long end = start + partSize + 1;
-            long endPos = Math.min(end + getOffset(channel, end), size);
+            long endPos = Math.min(end + getOffset(unsafe, address, end, size), size);
 
             int curr = i;
             long startPos = start;
 
             executor.submit(() -> {
-                results[curr] = processChunk(mappedBuffer, startPos, endPos, nameMap);
+                results[curr] = processChunk(unsafe, address, startPos, endPos);
             });
             start = endPos + 1;
         }
 
         executor.shutdown();
         executor.awaitTermination(1, TimeUnit.HOURS);
-
 
         var combined = new HashMap<Integer, Aggregate>();
 
@@ -116,94 +124,81 @@ public class CalculateAverage {
 
         var result = new TreeMap<String, String>();
 
-        combined.forEach((k, v) -> result.put(
-            new String(nameMap.get(k)),
-            v.toString()
-        ));
+        combined.values().forEach(v -> {
+            result.put(
+                new String(segment.asSlice(v.nameStart - address, v.nameEnd - v.nameStart)
+                    .toArray(ValueLayout.JAVA_BYTE)),
+                v.toString()
+            );
+        });
 
         System.out.println(result);
     }
 
     private static Map<Integer, Aggregate> processChunk(
-        MemorySegment memorySegment,
+        Unsafe unsafe,
+        long address,
         long start,
-        long end,
-        Map<Integer, byte[]> nameMap
+        long end
     ) {
-        try {
-            var map = new HashMap<Integer, Aggregate>();
+        var map = new HashMap<Integer, Aggregate>();
 
-            var parseBuffer = ByteBuffer.allocate(128);
+        long offset = start;
+        while (offset < end) {
+            long nameStart = address + offset;
+
+            byte b = unsafe.getByte(address + offset);
 
             int hash = 0;
-            long offset = start;
-            while (offset < end) {
-                byte b = memorySegment.get(ValueLayout.OfByte.JAVA_BYTE, offset);
-
-                if (b == DELIMITER) {
-                    var trimmed = trim(parseBuffer);
-                    hash = trimmed.hashCode();
-                    nameMap.put(hash, trimmed.array());
-                    parseBuffer.clear();
-                }
-                else if (b == NEW_LINE) {
-                    double value = fromBytes(parseBuffer.array(), parseBuffer.position());
-
-                    var aggregate = map.get(hash);
-                    if (aggregate == null) map.put(hash, new Aggregate(value));
-                    else aggregate.add(value);
-                    parseBuffer.clear();
-                } else {
-                    parseBuffer.put(b);
-                }
+            while (b != DELIMITER) {
+                hash = hash * 33 + b;
                 offset++;
+                b = unsafe.getByte(address + offset);
             }
-            return map;
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
-    }
 
-    private static ByteBuffer trim(ByteBuffer buffer) {
-        var bytes = new byte[buffer.position()];
-        System.arraycopy(buffer.array(), 0, bytes, 0, buffer.position());
-        return ByteBuffer.wrap(bytes);
-    }
+            long nameEnd = address + offset;
 
-    private static double fromBytes(byte[] bytes, int position) {
-        boolean signed = false;
+            // skip \n
+            offset++;
+            b = unsafe.getByte(address + offset);
 
-        int acc = 0;
-        int divider = 0;
-        for (int i = 0; i < position; i++) {
-            byte b = bytes[i];
-            if (b == MINUS_SIGN) {
-                signed = true;
-            } else if (b == DOT) {;
-                divider = position - i - 1 > 1 ? 100 : 10;
-            } else {
-                acc *= 10;
-                acc += b - ZERO;
+            boolean negative = b == MINUS_SIGN;
+            if (negative) {
+                offset++;
+                b = unsafe.getByte(address + offset);
             }
+
+            int temperature = 0;
+            while (b != DOT) {
+                temperature *= 10;
+                temperature += b - ZERO;
+                offset++;
+                b = unsafe.getByte(address + offset);
+            }
+
+            offset++;
+            b = unsafe.getByte(address + offset);
+            temperature *= 10;
+            temperature += b - ZERO;
+
+            if (negative) temperature = -temperature;
+
+            offset += 2; // skip \n and go to the next byte
+
+            var aggregate = map.get(hash);
+            if (aggregate == null) map.put(hash, new Aggregate(nameStart, nameEnd, (double) temperature/10));
+            else aggregate.add((double) temperature/10);
         }
-
-        if (signed) acc = -acc;
-
-        return (double) acc/divider;
-
+        return map;
     }
 
-    private static int getOffset(FileChannel channel, long start) throws IOException {
-        var buffer = ByteBuffer.allocate(128);
-        channel.read(buffer, start);
-
-        buffer.rewind();
-
+    private static int getOffset(Unsafe unsafe, long address, long start, long size) {
         int offset = 0;
 
-        while (buffer.hasRemaining()) {
-            if (buffer.get() == NEW_LINE) break;
+        while (start < size) {
+            if (unsafe.getByte(address + start) == NEW_LINE) break;
             offset++;
+            start++;
         }
 
         return offset;
