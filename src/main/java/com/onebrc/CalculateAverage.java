@@ -4,7 +4,6 @@ import sun.misc.Unsafe;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.foreign.ValueLayout;
 import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
@@ -12,7 +11,6 @@ import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
-import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -25,8 +23,11 @@ public class CalculateAverage {
     private static final byte MINUS_SIGN = 45;
     private static final byte DOT = 46;
     private static final byte ZERO = 48;
+    private static final int MAP_SIZE = 16384; // 2^14, closest to 10_000
+    private static final int MAP_MASK = MAP_SIZE - 1;
 
     private static class Aggregate {
+        private String name;
         private long nameStart;
         private long nameEnd;
         private double min;
@@ -68,9 +69,7 @@ public class CalculateAverage {
     }
 
     public static void main(String[] args) throws IOException, InterruptedException, NoSuchFieldException, IllegalAccessException {
-        var start = Instant.now();
         calculate();
-        System.out.println(Duration.between(start, Instant.now()).toString());
     }
 
     private static void calculate() throws IOException, InterruptedException, NoSuchFieldException, IllegalAccessException {
@@ -81,8 +80,7 @@ public class CalculateAverage {
         int processors = Runtime.getRuntime().availableProcessors();
         long partSize = size / processors;
 
-        @SuppressWarnings("unchecked")
-        Map<Integer, Aggregate>[] results = new Map[processors];
+        Aggregate[][] results = new Aggregate[processors][MAP_SIZE];
 
         var segment = channel.map(FileChannel.MapMode.READ_ONLY, 0, size, Arena.global());
         long address = segment.address();
@@ -110,38 +108,27 @@ public class CalculateAverage {
         executor.shutdown();
         executor.awaitTermination(1, TimeUnit.HOURS);
 
-        var combined = new HashMap<Integer, Aggregate>();
+        var combined = new HashMap<String, Aggregate>();
 
-        for (var map : results) {
-            for (var entry : map.entrySet()) {
-                if (!combined.containsKey(entry.getKey())) {
-                    combined.put(entry.getKey(), entry.getValue());
-                } else {
-                    combined.get(entry.getKey()).merge(entry.getValue());
-                }
+        for (var result : results) {
+            for (var aggregate : result) {
+                if (aggregate == null) continue;
+                var existing = combined.get(aggregate.name);
+                if (existing == null) combined.put(aggregate.name, aggregate);
+                else existing.merge(aggregate);
             }
         }
 
-        var result = new TreeMap<String, String>();
-
-        combined.values().forEach(v -> {
-            result.put(
-                new String(segment.asSlice(v.nameStart - address, v.nameEnd - v.nameStart)
-                    .toArray(ValueLayout.JAVA_BYTE)),
-                v.toString()
-            );
-        });
-
-        System.out.println(result);
+        System.out.println(new TreeMap<>(combined));
     }
 
-    private static Map<Integer, Aggregate> processChunk(
+    private static Aggregate[] processChunk(
         Unsafe unsafe,
         long address,
         long start,
         long end
     ) {
-        var map = new HashMap<Integer, Aggregate>();
+        var aggregates = new Aggregate[MAP_SIZE];
 
         long offset = start;
         while (offset < end) {
@@ -149,9 +136,9 @@ public class CalculateAverage {
 
             byte b = unsafe.getByte(address + offset);
 
-            int hash = 0;
+            int hash = 17;
             while (b != DELIMITER) {
-                hash = hash * 33 + b;
+                hash = hash * 31 + b;
                 offset++;
                 b = unsafe.getByte(address + offset);
             }
@@ -185,11 +172,60 @@ public class CalculateAverage {
 
             offset += 2; // skip \n and go to the next byte
 
-            var aggregate = map.get(hash);
-            if (aggregate == null) map.put(hash, new Aggregate(nameStart, nameEnd, (double) temperature/10));
-            else aggregate.add((double) temperature/10);
+            int index = hash & MAP_MASK;
+            Aggregate aggregate;
+            int currNameLength = (int) (nameEnd - nameStart);
+
+            while (true) {
+                aggregate = aggregates[index];
+                if (aggregate == null) break;
+                int nameLength = (int) (aggregate.nameEnd - aggregate.nameStart);
+                if (nameLength != currNameLength || !unsafeEquals(unsafe, nameStart, aggregate.nameStart, nameLength)) {
+                    index = (index + 1) & MAP_MASK;
+                } else {
+                    break;
+                }
+            }
+
+            if (aggregate == null) {
+                aggregates[index] = new Aggregate(nameStart, nameEnd, (double) temperature/10);
+            } else {
+                aggregate.add((double) temperature/10);
+            }
         }
-        return map;
+
+        for (Aggregate aggregate : aggregates) {
+            if (aggregate == null) continue;
+            int size = (int) (aggregate.nameEnd - aggregate.nameStart);
+            var bytes = new byte[size];
+            unsafe.copyMemory(null, aggregate.nameStart, bytes, Unsafe.ARRAY_BYTE_BASE_OFFSET, size);
+            aggregate.name = new String(bytes);
+        }
+
+        return aggregates;
+    }
+
+    private static boolean unsafeEquals(Unsafe unsafe, long firstAddress, long secondAddress, int nameLength) {
+        // compare 8 bytes while possible
+        while (nameLength > Long.BYTES) {
+            if (unsafe.getLong(firstAddress) != unsafe.getLong(secondAddress)) {
+                return false;
+            }
+            nameLength -= Long.BYTES;
+            firstAddress += Long.BYTES;
+            secondAddress += Long.BYTES;
+        }
+
+        // byte comparison for the leftover if any
+        while (nameLength > 0) {
+            if (unsafe.getByte(firstAddress) != unsafe.getByte(secondAddress)) {
+                return false;
+            }
+            nameLength--;
+            firstAddress++;
+            secondAddress++;
+        }
+        return true;
     }
 
     private static int getOffset(Unsafe unsafe, long address, long start, long size) {
