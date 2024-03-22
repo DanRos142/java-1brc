@@ -1,4 +1,4 @@
-An implementation of 1brc challenge - https://github.com/gunnarmorling/1brc
+# An implementation of 1brc challenge - https://github.com/gunnarmorling/1brc
 
 Baseline & measurements creation are copied from the repo mentioned above - all credits to https://github.com/gunnarmorling.  
 
@@ -19,3 +19,12 @@ Baseline version takes around 3 minutes to complete on `GraalVM 21.0.2`
 Unsafe implementation w/ manual hashing & hash maps does `10kk` records in less than a second, around 15 secs on a billion records
 
 Possible ways to improve further - read 8 byte chunks as longs and use masks to strip unnecessary bytes
+
+# Executable binary how to:
+
+```
+javac --enable-preview --release 21 -d build src/main/java/com/onebrc/CalculateAverage.java
+jar --create --file CalculateAverage.jar --main-class com.onebrc.CalculateAverage -C build .
+native-image --enable-preview -jar CalculateAverage.jar
+./CalculateAverage
+```

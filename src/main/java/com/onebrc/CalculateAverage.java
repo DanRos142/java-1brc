@@ -10,7 +10,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.TreeMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -28,8 +27,8 @@ public class CalculateAverage {
 
     private static class Aggregate {
         private String name;
-        private long nameStart;
-        private long nameEnd;
+        private final long nameStart;
+        private final long nameEnd;
         private double min;
         private double max;
         private double sum;
@@ -69,7 +68,9 @@ public class CalculateAverage {
     }
 
     public static void main(String[] args) throws IOException, InterruptedException, NoSuchFieldException, IllegalAccessException {
+        var start = Instant.now();
         calculate();
+        System.out.println(Duration.between(start, Instant.now()).toString());
     }
 
     private static void calculate() throws IOException, InterruptedException, NoSuchFieldException, IllegalAccessException {
@@ -108,7 +109,7 @@ public class CalculateAverage {
         executor.shutdown();
         executor.awaitTermination(1, TimeUnit.HOURS);
 
-        var combined = new HashMap<String, Aggregate>();
+        var combined = new TreeMap<String, Aggregate>();
 
         for (var result : results) {
             for (var aggregate : result) {
@@ -119,7 +120,7 @@ public class CalculateAverage {
             }
         }
 
-        System.out.println(new TreeMap<>(combined));
+        System.out.println(combined);
     }
 
     private static Aggregate[] processChunk(
@@ -129,48 +130,72 @@ public class CalculateAverage {
         long end
     ) {
         var aggregates = new Aggregate[MAP_SIZE];
-
+        var bytes = new byte[Long.BYTES];
         long offset = start;
+        long word;
         while (offset < end) {
             long nameStart = address + offset;
 
-            byte b = unsafe.getByte(address + offset);
+            int hash = 33;
 
-            int hash = 17;
-            while (b != DELIMITER) {
-                hash = hash * 31 + b;
-                offset++;
-                b = unsafe.getByte(address + offset);
+            while (true) {
+                word = unsafe.getLong(address + offset);
+                bytes[0] = (byte) word;
+                bytes[1] = (byte) (word >> 8);
+                bytes[2] = (byte) (word >> 16);
+                bytes[3] = (byte) (word >> 24);
+                bytes[4] = (byte) (word >> 32);
+                bytes[5] = (byte) (word >> 40);
+                bytes[6] = (byte) (word >> 48);
+                bytes[7] = (byte) (word >> 56);
+
+                boolean stop = false;
+                for (int i = 0; i < Long.BYTES; i++) {
+                    if (bytes[i] == DELIMITER) {
+                        offset += i;
+                        stop = true;
+                        break;
+                    }
+                    hash = hash * 31 + bytes[i];
+                }
+                if (stop) break;
+                offset += Long.BYTES;
             }
 
             long nameEnd = address + offset;
 
             // skip \n
             offset++;
-            b = unsafe.getByte(address + offset);
 
-            boolean negative = b == MINUS_SIGN;
-            if (negative) {
-                offset++;
-                b = unsafe.getByte(address + offset);
-            }
+            word = unsafe.getLong(address + offset);
 
             int temperature = 0;
-            while (b != DOT) {
+            boolean negative = false;
+
+            bytes[0] = (byte) word;
+            bytes[1] = (byte) (word >> 8);
+            bytes[2] = (byte) (word >> 16);
+            bytes[3] = (byte) (word >> 24);
+            bytes[4] = (byte) (word >> 32);
+            bytes[5] = (byte) (word >> 40);
+            bytes[6] = (byte) (word >> 48);
+            bytes[7] = (byte) (word >> 56);
+
+            for (int i = 0; i < Long.BYTES; i++) {
+                if (bytes[i] == NEW_LINE) {
+                    offset += i + 1;
+                    break;
+                }
+                if (bytes[i] == MINUS_SIGN) {
+                    negative = true;
+                    continue;
+                }
+                if (bytes[i] == DOT) continue;
                 temperature *= 10;
-                temperature += b - ZERO;
-                offset++;
-                b = unsafe.getByte(address + offset);
+                temperature += bytes[i] - ZERO;
             }
 
-            offset++;
-            b = unsafe.getByte(address + offset);
-            temperature *= 10;
-            temperature += b - ZERO;
-
             if (negative) temperature = -temperature;
-
-            offset += 2; // skip \n and go to the next byte
 
             int index = hash & MAP_MASK;
             Aggregate aggregate;
@@ -178,28 +203,26 @@ public class CalculateAverage {
 
             while (true) {
                 aggregate = aggregates[index];
-                if (aggregate == null) break;
+                if (aggregate == null) {
+                    aggregates[index] = new Aggregate(nameStart, nameEnd, (double) temperature/10);
+                    break;
+                }
                 int nameLength = (int) (aggregate.nameEnd - aggregate.nameStart);
                 if (nameLength != currNameLength || !unsafeEquals(unsafe, nameStart, aggregate.nameStart, nameLength)) {
                     index = (index + 1) & MAP_MASK;
                 } else {
+                    aggregate.add((double) temperature/10);
                     break;
                 }
-            }
-
-            if (aggregate == null) {
-                aggregates[index] = new Aggregate(nameStart, nameEnd, (double) temperature/10);
-            } else {
-                aggregate.add((double) temperature/10);
             }
         }
 
         for (Aggregate aggregate : aggregates) {
             if (aggregate == null) continue;
             int size = (int) (aggregate.nameEnd - aggregate.nameStart);
-            var bytes = new byte[size];
-            unsafe.copyMemory(null, aggregate.nameStart, bytes, Unsafe.ARRAY_BYTE_BASE_OFFSET, size);
-            aggregate.name = new String(bytes);
+            var name = new byte[size];
+            unsafe.copyMemory(null, aggregate.nameStart, name, Unsafe.ARRAY_BYTE_BASE_OFFSET, size);
+            aggregate.name = new String(name);
         }
 
         return aggregates;
